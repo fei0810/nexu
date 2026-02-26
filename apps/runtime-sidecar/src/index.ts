@@ -4,8 +4,32 @@ import { env, envWarnings } from "./env";
 import { log } from "./log";
 import { runHeartbeatLoop, runPollLoop } from "./loops";
 import { createRuntimeState } from "./state";
+import { sleep } from "./utils";
 
 const state = createRuntimeState();
+
+async function registerPoolWithRetry(): Promise<void> {
+  let attempt = 1;
+  let retryDelayMs = 1000;
+
+  while (true) {
+    try {
+      await registerPool();
+      return;
+    } catch (error: unknown) {
+      log("pool registration failed; retrying", {
+        attempt,
+        poolId: env.RUNTIME_POOL_ID,
+        retryDelayMs,
+        error: error instanceof Error ? error.message : "unknown_error",
+      });
+
+      await sleep(retryDelayMs);
+      retryDelayMs = Math.min(retryDelayMs * 2, env.RUNTIME_MAX_BACKOFF_MS);
+      attempt += 1;
+    }
+  }
+}
 
 async function main(): Promise<void> {
   if (envWarnings.usedHostnameAsRuntimePoolId) {
@@ -17,7 +41,7 @@ async function main(): Promise<void> {
 
   log("starting runtime sidecar", { poolId: env.RUNTIME_POOL_ID });
   await waitGatewayReady();
-  await registerPool();
+  await registerPoolWithRetry();
   log("pool registered", { poolId: env.RUNTIME_POOL_ID });
 
   void runHeartbeatLoop(state);

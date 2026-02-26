@@ -268,6 +268,7 @@ export async function generatePoolConfig(
     config.channels.discord = {
       enabled: true,
       groupPolicy: "open",
+      dmPolicy: "open",
       accounts: discordAccounts,
     };
   }

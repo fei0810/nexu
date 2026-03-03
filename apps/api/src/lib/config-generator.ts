@@ -2,6 +2,7 @@ import type {
   AgentConfig,
   BindingConfig,
   DiscordAccountConfig,
+  FeishuAccountConfig,
   OpenClawConfig,
   SlackAccountConfig,
 } from "@nexu/shared";
@@ -117,10 +118,15 @@ export async function generatePoolConfig(
     return `litellm/${rawModelId}`;
   }
 
+  // Workspace path must be under the PVC mount so agent files survive pod restarts.
+  // OPENCLAW_STATE_DIR is set to /data/openclaw in production (the PVC mount point).
+  const stateDir = process.env.OPENCLAW_STATE_DIR ?? "/data/openclaw";
+
   const agentList: AgentConfig[] = activeBots.map((bot, index) => {
     const agent: AgentConfig = {
       id: bot.slug,
       name: bot.name,
+      workspace: `${stateDir}/workspaces/${bot.slug}`,
     };
 
     if (index === 0) {
@@ -136,6 +142,7 @@ export async function generatePoolConfig(
 
   const slackAccounts: Record<string, SlackAccountConfig> = {};
   const discordAccounts: Record<string, DiscordAccountConfig> = {};
+  const feishuAccounts: Record<string, FeishuAccountConfig> = {};
   const bindingsList: BindingConfig[] = [];
 
   for (const ch of channelsWithBots) {
@@ -200,6 +207,32 @@ export async function generatePoolConfig(
           accountId: ch.accountId,
         },
       });
+    } else if (ch.channelType === "feishu") {
+      const credMap = new Map<string, string>();
+      for (const cred of ch.credentials) {
+        try {
+          credMap.set(cred.credentialType, decrypt(cred.encryptedValue));
+        } catch {
+          credMap.set(cred.credentialType, "");
+        }
+      }
+
+      const appId = credMap.get("appId") ?? "";
+      const appSecret = credMap.get("appSecret") ?? "";
+
+      feishuAccounts[ch.accountId] = {
+        enabled: true,
+        appId,
+        appSecret,
+      };
+
+      bindingsList.push({
+        agentId: ch.botSlug,
+        match: {
+          channel: "feishu",
+          accountId: ch.accountId,
+        },
+      });
     }
   }
 
@@ -237,7 +270,7 @@ export async function generatePoolConfig(
       exec: {
         security: "full",
         ask: "off",
-        host: "sandbox",
+        host: "gateway",
       },
       web: {
         search: { enabled: true },
@@ -297,6 +330,18 @@ export async function generatePoolConfig(
       dmPolicy: "open",
       allowFrom: ["*"],
       accounts: discordAccounts,
+    };
+  }
+
+  if (Object.keys(feishuAccounts).length > 0) {
+    config.channels.feishu = {
+      enabled: true,
+      connectionMode: "websocket",
+      dmPolicy: "open",
+      groupPolicy: "open",
+      requireMention: true,
+      allowFrom: ["*"],
+      accounts: feishuAccounts,
     };
   }
 

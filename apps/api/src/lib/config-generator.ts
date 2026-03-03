@@ -270,7 +270,7 @@ export async function generatePoolConfig(
       exec: {
         security: "full",
         ask: "off",
-        host: "sandbox",
+        host: "gateway",
       },
       web: {
         search: { enabled: true },

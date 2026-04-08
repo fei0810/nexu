@@ -538,6 +538,15 @@ export class NexuConfigStore {
     });
   }
 
+  private isCurrentPollingSignal(signal: AbortSignal): boolean {
+    // The polling loop may still be processing a response when a newer
+    // connectDesktopCloud() call has already aborted it and installed a fresh
+    // pollingState. Identifying the active poll by AbortSignal identity lets
+    // any final-state write from a stale loop become a no-op instead of
+    // clobbering the new flow's pollingState or persisted credentials.
+    return this.pollingState?.abortController.signal === signal;
+  }
+
   private async pollDesktopCloudAuthorization(
     cloudApiUrl: string,
     deviceId: string,
@@ -584,6 +593,9 @@ export class NexuConfigStore {
               : ((await this.fetchDesktopCloudModels(linkUrl, data.apiKey)) ??
                 []);
 
+          if (signal.aborted || !this.isCurrentPollingSignal(signal)) {
+            return;
+          }
           this.pollingState = null;
           await this.setDesktopCloudState({
             connected: true,
@@ -605,6 +617,9 @@ export class NexuConfigStore {
         }
 
         if (data.status === "expired") {
+          if (signal.aborted || !this.isCurrentPollingSignal(signal)) {
+            return;
+          }
           this.pollingState = null;
           await this.setDesktopCloudState({
             connected: false,
@@ -626,6 +641,9 @@ export class NexuConfigStore {
       }
     }
 
+    if (signal.aborted || !this.isCurrentPollingSignal(signal)) {
+      return;
+    }
     this.pollingState = null;
     await this.setDesktopCloudState({
       connected: false,
@@ -1815,16 +1833,37 @@ export class NexuConfigStore {
     });
   }
 
+  private abortDesktopCloudPolling(): void {
+    if (this.pollingState) {
+      this.pollingState.abortController.abort();
+      this.pollingState = null;
+    }
+  }
+
   async connectDesktopCloud(options?: { source?: string | null }) {
     const config = await this.getConfig();
     const current = readDesktopCloud(config);
     const { activeProfile } =
       await this.readConfiguredDesktopCloudProfile(config);
-    if (this.pollingState || current.polling) {
-      return { error: "Connection attempt already in progress" };
-    }
     if (current.connected && current.apiKey) {
       return { error: "Already connected. Disconnect first." };
+    }
+    // If a previous connect attempt is still polling (e.g. the user closed the
+    // authorization tab without completing the flow), cancel it and clear the
+    // persisted polling flag so this call can start a fresh browser login.
+    if (this.pollingState || current.polling) {
+      this.abortDesktopCloudPolling();
+      await this.setDesktopCloudState({
+        connected: false,
+        polling: false,
+        userId: null,
+        userName: null,
+        userEmail: null,
+        connectedAt: null,
+        linkUrl: null,
+        apiKey: null,
+        models: [],
+      });
     }
     const trimmedSource = options?.source?.trim();
     const sourceQuery =
@@ -2040,10 +2079,7 @@ export class NexuConfigStore {
 
     const previousCloud = readDesktopCloud(await this.getConfig());
 
-    if (this.pollingState) {
-      this.pollingState.abortController.abort();
-      this.pollingState = null;
-    }
+    this.abortDesktopCloudPolling();
 
     await this.store.update((config) => {
       const currentProfile = readLocalProfile(config);
@@ -2107,10 +2143,7 @@ export class NexuConfigStore {
       throw new Error(`Unknown cloud profile: ${name}`);
     }
 
-    if (this.pollingState) {
-      this.pollingState.abortController.abort();
-      this.pollingState = null;
-    }
+    this.abortDesktopCloudPolling();
 
     await this.store.update((currentConfig) => {
       const sessions = readDesktopCloudSessions(currentConfig);
@@ -2252,10 +2285,7 @@ export class NexuConfigStore {
 
   async disconnectDesktopCloud() {
     const previousCloud = readDesktopCloud(await this.getConfig());
-    if (this.pollingState) {
-      this.pollingState.abortController.abort();
-      this.pollingState = null;
-    }
+    this.abortDesktopCloudPolling();
 
     await this.setDesktopCloudState({
       connected: false,

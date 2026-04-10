@@ -7,12 +7,18 @@ import {
 } from "@/hooks/use-desktop-cloud-status";
 import { useGitHubStars } from "@/hooks/use-github-stars";
 import { useLocale } from "@/hooks/use-locale";
+import { getAnalyticsAppMetadata } from "@/lib/analytics-app-metadata";
 import {
   openExternalUrl,
   openLocalFolderUrl,
   pathToFileUrl,
 } from "@/lib/desktop-links";
-import { track } from "@/lib/tracking";
+import {
+  ANALYTICS_PREFERENCE_STORAGE_KEY,
+  disableAnalytics,
+  initializeAnalytics,
+  track,
+} from "@/lib/tracking";
 import { cn } from "@/lib/utils";
 import {
   type ProviderRegistryEntryDto,
@@ -47,6 +53,7 @@ import { toast } from "sonner";
 import {
   deleteApiV1ModelProvidersMinimaxOauthLogin,
   getApiInternalDesktopDefaultModel,
+  getApiInternalDesktopPreferences,
   getApiInternalDesktopReady,
   getApiV1ModelProvidersByProviderIdOauthProviderStatus,
   getApiV1ModelProvidersByProviderIdOauthStatus,
@@ -54,6 +61,7 @@ import {
   getApiV1ModelProvidersMinimaxOauthStatus,
   getApiV1ModelProvidersRegistry,
   getApiV1Models,
+  patchApiInternalDesktopPreferences,
   postApiInternalDesktopCloudConnect,
   postApiInternalDesktopCloudDisconnect,
   postApiInternalDesktopCloudRefresh,
@@ -538,7 +546,6 @@ function _GeneralSettings() {
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [accountConnecting, setAccountConnecting] = useState(false);
   const [accountDisconnecting, setAccountDisconnecting] = useState(false);
-  const [analyticsEnabled, setAnalyticsEnabled] = useState(true);
   const [crashReportsEnabled, setCrashReportsEnabled] = useState(true);
   const hostBridge = getModelsHostInvokeBridge();
   const { data: desktopCloudStatus, refetch: refetchDesktopCloudStatus } =
@@ -577,6 +584,56 @@ function _GeneralSettings() {
     },
     onSuccess: (data) => {
       queryClient.setQueryData(["desktop-shell-preferences"], data);
+    },
+    onError: () => {
+      toast.error(t("settings.desktop.updateFailed"));
+    },
+  });
+
+  const { data: desktopPreferences } = useQuery({
+    queryKey: ["desktop-preferences"],
+    queryFn: async () => {
+      const { data } = await getApiInternalDesktopPreferences();
+      return data;
+    },
+  });
+
+  const updateDesktopPreferences = useMutation({
+    mutationFn: async (input: { analyticsEnabled: boolean }) => {
+      const response = await patchApiInternalDesktopPreferences({
+        body: { analyticsEnabled: input.analyticsEnabled },
+      });
+      if (!response.data) {
+        throw new Error("Desktop preferences update returned no data.");
+      }
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData(["desktop-preferences"], data);
+      try {
+        localStorage.setItem(
+          ANALYTICS_PREFERENCE_STORAGE_KEY,
+          data.analyticsEnabled ? "1" : "0",
+        );
+      } catch {
+        // ignore local persistence failures
+      }
+
+      if (data.analyticsEnabled) {
+        const posthogApiKey = import.meta.env.VITE_POSTHOG_API_KEY;
+        if (posthogApiKey) {
+          const { appName, appVersion } = getAnalyticsAppMetadata();
+          initializeAnalytics({
+            apiKey: posthogApiKey,
+            apiHost: import.meta.env.VITE_POSTHOG_HOST,
+            environment: import.meta.env.MODE,
+            appName,
+            appVersion,
+          });
+        }
+      } else {
+        disableAnalytics();
+      }
     },
     onError: () => {
       toast.error(t("settings.desktop.updateFailed"));
@@ -943,8 +1000,13 @@ function _GeneralSettings() {
               </div>
             </div>
             <Switch
-              checked={analyticsEnabled}
-              onCheckedChange={setAnalyticsEnabled}
+              checked={desktopPreferences?.analyticsEnabled ?? false}
+              disabled={updateDesktopPreferences.isPending}
+              onCheckedChange={(checked) => {
+                void updateDesktopPreferences.mutateAsync({
+                  analyticsEnabled: checked,
+                });
+              }}
             />
           </div>
 

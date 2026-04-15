@@ -1,8 +1,16 @@
-import { type ChildProcess, execSync, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  execFile,
+  execSync,
+  spawn,
+} from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { ControllerEnv } from "../app/env.js";
@@ -37,6 +45,20 @@ function findWorkspaceRoot(startDir: string): string | null {
   return null;
 }
 
+function resolveOpenclawEntryFromBin(binPath: string): string | null {
+  const resolvedBinPath = path.resolve(binPath.trim());
+  if (resolvedBinPath.endsWith(".mjs") && existsSync(resolvedBinPath)) {
+    return resolvedBinPath;
+  }
+
+  const entry = path.resolve(
+    path.dirname(resolvedBinPath),
+    "..",
+    "node_modules/openclaw/openclaw.mjs",
+  );
+  return existsSync(entry) ? entry : null;
+}
+
 export interface OpenClawRuntimeEvent {
   event: string;
   payload?: unknown;
@@ -53,6 +75,10 @@ export class OpenClawProcessManager {
   private eventListeners = new Set<(event: OpenClawRuntimeEvent) => void>();
 
   constructor(private readonly env: ControllerEnv) {}
+
+  managesProcess(): boolean {
+    return this.env.manageOpenclawProcess;
+  }
 
   async prepare(): Promise<void> {
     if (!this.env.manageOpenclawProcess) {
@@ -118,34 +144,43 @@ export class OpenClawProcessManager {
     let extraEnv: Record<string, string> = {};
 
     if (electronExec) {
-      const workspaceRoot =
-        process.env.NEXU_WORKSPACE_ROOT?.trim() ||
-        findWorkspaceRoot(process.cwd());
-      const runtimeEntryPath = workspaceRoot
-        ? path.join(
-            workspaceRoot,
-            "openclaw-runtime",
-            "node_modules",
-            "openclaw",
-            "openclaw.mjs",
-          )
-        : null;
-
-      if (runtimeEntryPath && existsSync(runtimeEntryPath)) {
+      const openclawEntryFromBin = resolveOpenclawEntryFromBin(
+        this.env.openclawBin,
+      );
+      if (openclawEntryFromBin) {
         cmd = electronExec;
-        args = [runtimeEntryPath, "gateway", "run"];
+        args = [openclawEntryFromBin, "gateway", "run"];
         extraEnv = { ELECTRON_RUN_AS_NODE: "1" };
       } else {
-        // Resolve the openclaw entry point relative to the bin script
-        const binDir = path.dirname(path.resolve(this.env.openclawBin));
-        const entry = path.resolve(
-          binDir,
-          "..",
-          "node_modules/openclaw/openclaw.mjs",
-        );
-        cmd = electronExec;
-        args = [entry, "gateway", "run"];
-        extraEnv = { ELECTRON_RUN_AS_NODE: "1" };
+        const workspaceRoot =
+          process.env.NEXU_WORKSPACE_ROOT?.trim() ||
+          findWorkspaceRoot(process.cwd());
+        const runtimeEntryPath = workspaceRoot
+          ? path.join(
+              workspaceRoot,
+              "openclaw-runtime",
+              "node_modules",
+              "openclaw",
+              "openclaw.mjs",
+            )
+          : null;
+
+        if (runtimeEntryPath && existsSync(runtimeEntryPath)) {
+          cmd = electronExec;
+          args = [runtimeEntryPath, "gateway", "run"];
+          extraEnv = { ELECTRON_RUN_AS_NODE: "1" };
+        } else {
+          // Resolve the openclaw entry point relative to the bin script
+          const entry = resolveOpenclawEntryFromBin(this.env.openclawBin);
+          if (!entry) {
+            throw new Error(
+              "Unable to resolve OpenClaw entry point from OPENCLAW_BIN",
+            );
+          }
+          cmd = electronExec;
+          args = [entry, "gateway", "run"];
+          extraEnv = { ELECTRON_RUN_AS_NODE: "1" };
+        }
       }
     } else {
       cmd = this.env.openclawBin;
@@ -245,6 +280,47 @@ export class OpenClawProcessManager {
       "restarting unhealthy openclaw process",
     );
     this.child.kill("SIGKILL");
+  }
+
+  /**
+   * Restart the gateway regardless of whether the controller manages the
+   * process directly (dev / local-dev) or an external supervisor owns it
+   * (packaged desktop via launchd). Returns once the restart has been
+   * initiated — callers that need readiness should probe separately.
+   */
+  async restart(reason: string): Promise<void> {
+    logger.info({ reason }, "openclaw_restart_requested");
+
+    if (this.env.manageOpenclawProcess) {
+      await this.stop();
+      this.enableAutoRestart();
+      this.start();
+      return;
+    }
+
+    if (this.env.openclawLaunchdLabel) {
+      const domain = `gui/${os.userInfo().uid}/${this.env.openclawLaunchdLabel}`;
+      try {
+        await execFileAsync("launchctl", ["kickstart", "-k", domain]);
+        logger.info({ reason, domain }, "openclaw_restart_launchd_kickstarted");
+      } catch (err) {
+        logger.error(
+          { reason, domain, err },
+          "openclaw_restart_launchd_failed",
+        );
+        throw err;
+      }
+      return;
+    }
+
+    logger.warn(
+      {
+        reason,
+        manageOpenclawProcess: this.env.manageOpenclawProcess,
+        hasLaunchdLabel: false,
+      },
+      "openclaw_restart_skipped_no_supervisor",
+    );
   }
 
   async stop(): Promise<void> {

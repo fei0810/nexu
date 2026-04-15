@@ -13,6 +13,7 @@ import {
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveBuildTargetPlatform } from "./platforms/platform-resolver.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const electronRoot = resolve(scriptDir, "..");
@@ -26,6 +27,10 @@ const isUnsigned =
   process.env.NEXU_DESKTOP_MAC_UNSIGNED?.toLowerCase() === "true";
 const targetMacArch = resolveTargetMacArch();
 const macTargets = resolveMacTargets();
+const buildTargetPlatform = resolveBuildTargetPlatform({
+  env: process.env,
+  platform: process.platform,
+});
 const dmgBuilderReleaseName = "dmg-builder@1.2.0";
 const dmgBuilderReleaseVersion = "75c8a6c";
 const dmgBuilderArch = targetMacArch === "arm64" ? "arm64" : "x86_64";
@@ -75,6 +80,15 @@ async function ensureExistingPath(path, label) {
   }
 }
 
+async function pathExists(targetPath) {
+  try {
+    await lstat(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureExistingBuildArtifacts() {
   await Promise.all([
     ensureExistingPath(
@@ -109,6 +123,21 @@ async function ensureExistingRuntimeInstall() {
       "openclaw-runtime cache",
     ),
   ]);
+}
+
+// Only honor an explicitly provided electron dist override (used by e2e
+// coverage tooling). When unset, return null so electron-builder falls back
+// to its default electron resolution. Pointing electron-builder directly at
+// the pnpm-stored Electron.app caused codesign to fail with "bundle format is
+// ambiguous" because the framework symlink layout did not survive the copy
+// from the pnpm content-addressable store (regression from #698).
+async function resolveElectronDistPath() {
+  const override = process.env.NEXU_DESKTOP_ELECTRON_DIST_PATH;
+  if (!override) {
+    return null;
+  }
+  await ensureExistingPath(override, "electron dist override");
+  return override;
 }
 
 async function timedStep(stepName, fn, timings) {
@@ -443,6 +472,62 @@ async function stapleNotarizedAppBundles() {
   }
 }
 
+const requiredBundledPluginArtifacts = [
+  {
+    pluginId: "openclaw-qqbot",
+    requiredPath: ["node_modules", "silk-wasm", "package.json"],
+    label: "silk-wasm",
+  },
+  {
+    pluginId: "dingtalk-connector",
+    requiredPath: ["node_modules", "dingtalk-stream", "package.json"],
+    label: "dingtalk-stream",
+  },
+];
+
+async function validatePackagedBundledPluginDependencies(releaseRoot) {
+  const appBundleDirs = await readdir(releaseRoot, { withFileTypes: true });
+  const packagedMacBundles = appBundleDirs.filter(
+    (entry) =>
+      entry.isDirectory() &&
+      (entry.name === "mac" || entry.name.startsWith("mac-")),
+  );
+
+  if (packagedMacBundles.length === 0) {
+    throw new Error(
+      `[dist:mac] expected packaged macOS app bundles under ${releaseRoot}, but none were found.`,
+    );
+  }
+
+  for (const entry of packagedMacBundles) {
+    const appRoot = resolve(releaseRoot, entry.name, "Nexu.app");
+    for (const artifact of requiredBundledPluginArtifacts) {
+      const pluginRoot = resolve(
+        appRoot,
+        "Contents",
+        "Resources",
+        "runtime",
+        "controller",
+        "plugins",
+        artifact.pluginId,
+      );
+      const dependencyPath = resolve(pluginRoot, ...artifact.requiredPath);
+
+      if (!(await pathExists(pluginRoot))) {
+        throw new Error(
+          `[dist:mac] packaged app is missing ${artifact.pluginId}: ${pluginRoot}`,
+        );
+      }
+
+      if (!(await pathExists(dependencyPath))) {
+        throw new Error(
+          `[dist:mac] packaged app is missing ${artifact.pluginId} dependency ${artifact.label}: ${dependencyPath}`,
+        );
+      }
+    }
+  }
+}
+
 async function ensureBuildConfig() {
   const configPath = resolve(electronRoot, "build-config.json");
   const isCi =
@@ -566,12 +651,48 @@ async function ensureBuildConfig() {
       merged.NEXU_DESKTOP_BUILD_TIME ??
       existingConfig.NEXU_DESKTOP_BUILD_TIME ??
       defaultMetadata.NEXU_DESKTOP_BUILD_TIME,
+    ...((merged.POSTHOG_API_KEY ?? existingConfig.POSTHOG_API_KEY)
+      ? {
+          POSTHOG_API_KEY:
+            merged.POSTHOG_API_KEY ?? existingConfig.POSTHOG_API_KEY,
+        }
+      : {}),
+    ...((merged.POSTHOG_HOST ?? existingConfig.POSTHOG_HOST)
+      ? {
+          POSTHOG_HOST: merged.POSTHOG_HOST ?? existingConfig.POSTHOG_HOST,
+        }
+      : {}),
+    ...((merged.LANGFUSE_PUBLIC_KEY ?? existingConfig.LANGFUSE_PUBLIC_KEY)
+      ? {
+          LANGFUSE_PUBLIC_KEY:
+            merged.LANGFUSE_PUBLIC_KEY ?? existingConfig.LANGFUSE_PUBLIC_KEY,
+        }
+      : {}),
+    ...((merged.LANGFUSE_SECRET_KEY ?? existingConfig.LANGFUSE_SECRET_KEY)
+      ? {
+          LANGFUSE_SECRET_KEY:
+            merged.LANGFUSE_SECRET_KEY ?? existingConfig.LANGFUSE_SECRET_KEY,
+        }
+      : {}),
+    ...((merged.LANGFUSE_BASE_URL ?? existingConfig.LANGFUSE_BASE_URL)
+      ? {
+          LANGFUSE_BASE_URL:
+            merged.LANGFUSE_BASE_URL ?? existingConfig.LANGFUSE_BASE_URL,
+        }
+      : {}),
   };
 
   await writeFile(configPath, JSON.stringify(config, null, 2));
+  const redactedConfig = {
+    ...config,
+    hasLangfusePublicKey: typeof config.LANGFUSE_PUBLIC_KEY === "string",
+    hasLangfuseSecretKey: typeof config.LANGFUSE_SECRET_KEY === "string",
+    LANGFUSE_PUBLIC_KEY: undefined,
+    LANGFUSE_SECRET_KEY: undefined,
+  };
   console.log(
     "[dist:mac] generated build-config.json from env:",
-    JSON.stringify(config),
+    JSON.stringify(redactedConfig),
   );
 }
 
@@ -594,9 +715,9 @@ async function getElectronVersion() {
 
 async function main() {
   const timings = [];
-  if (process.platform !== "darwin") {
+  if (buildTargetPlatform !== "mac") {
     throw new Error(
-      `[dist:mac] mac packaging must run on macOS: platform=${process.platform}, target=${targetMacArch}.`,
+      `[dist:mac] mac packaging must run with target platform "mac": host=${process.platform}, target=${buildTargetPlatform}, arch=${targetMacArch}.`,
     );
   }
 
@@ -762,6 +883,7 @@ async function main() {
   // Falls back to "dev" for local builds outside a git repo.
   let buildVersion = "dev";
   const electronVersion = await getElectronVersion();
+  const electronDistPath = await resolveElectronDistPath();
   try {
     buildVersion = execFileSync("git", ["rev-parse", "--short=7", "HEAD"], {
       encoding: "utf8",
@@ -780,6 +902,9 @@ async function main() {
         "--publish",
         "never",
         `--config.electronVersion=${electronVersion}`,
+        ...(electronDistPath
+          ? [`--config.electronDist=${electronDistPath}`]
+          : []),
         `--config.buildVersion=${buildVersion}`,
         `--config.directories.output=${releaseRoot}`,
         ...(isFastCiMode
@@ -803,6 +928,11 @@ async function main() {
           : notarizeEnv,
       });
     },
+    timings,
+  );
+  await timedStep(
+    "validate packaged bundled plugin dependencies",
+    async () => validatePackagedBundledPluginDependencies(releaseRoot),
     timings,
   );
   await timedStep(

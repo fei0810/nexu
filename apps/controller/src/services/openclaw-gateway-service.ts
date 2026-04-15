@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import type { OpenClawConfig } from "@nexu/shared";
 import { logger } from "../lib/logger.js";
+import { serializeOpenClawConfig } from "../lib/openclaw-config-serialization.js";
 import type { OpenClawWsClient } from "../runtime/openclaw-ws-client.js";
 import type { ControllerRuntimeState } from "../runtime/state.js";
 
@@ -112,6 +113,30 @@ function isImplicitlyReadyChannelType(channelType: string): boolean {
   return channelType === "feishu";
 }
 
+function isConfiguredAsConnectedChannelType(channelType: string): boolean {
+  return channelType === "dingtalk";
+}
+
+function resolveOpenClawChannelType(channelType: string): string {
+  if (channelType === "wechat") {
+    return "openclaw-weixin";
+  }
+  if (channelType === "dingtalk") {
+    return "dingtalk-connector";
+  }
+  return channelType;
+}
+
+function resolveOpenClawAccountId(
+  channelType: string,
+  accountId: string,
+): string {
+  if (channelType === "dingtalk" && accountId === "default") {
+    return "__default__";
+  }
+  return accountId;
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -164,36 +189,81 @@ export class OpenClawGatewayService {
   async sendChannelMessage(
     input: SendChannelMessageInput,
   ): Promise<SendChannelMessageResult> {
-    return this.wsClient.request<SendChannelMessageResult>("send", {
-      to: input.to,
-      message: input.message,
-      channel: input.channel,
-      accountId: input.accountId,
-      threadId: input.threadId,
-      sessionKey: input.sessionKey,
-      idempotencyKey:
-        input.idempotencyKey ??
-        createHash("sha256")
-          .update(
-            JSON.stringify({
-              channel: input.channel,
-              to: input.to,
-              message: input.message,
-              accountId: input.accountId ?? null,
-              threadId: input.threadId ?? null,
-              sessionKey: input.sessionKey ?? null,
-            }),
-          )
-          .digest("hex"),
-    });
+    const startedAt = Date.now();
+    const idempotencyKey =
+      input.idempotencyKey ??
+      createHash("sha256")
+        .update(
+          JSON.stringify({
+            channel: input.channel,
+            to: input.to,
+            message: input.message,
+            accountId: input.accountId ?? null,
+            threadId: input.threadId ?? null,
+            sessionKey: input.sessionKey ?? null,
+          }),
+        )
+        .digest("hex");
+
+    logger.info(
+      {
+        channel: input.channel,
+        to: input.to,
+        accountId: input.accountId ?? null,
+        threadId: input.threadId ?? null,
+        sessionKey: input.sessionKey ?? null,
+        idempotencyKey,
+        messageLength: input.message.length,
+      },
+      "openclaw_send_request_start",
+    );
+
+    try {
+      const result = await this.wsClient.request<SendChannelMessageResult>(
+        "send",
+        {
+          to: input.to,
+          message: input.message,
+          channel: input.channel,
+          accountId: input.accountId,
+          threadId: input.threadId,
+          sessionKey: input.sessionKey,
+          idempotencyKey,
+        },
+      );
+
+      logger.info(
+        {
+          channel: input.channel,
+          idempotencyKey,
+          durationMs: Date.now() - startedAt,
+          runId: result.runId ?? null,
+          messageId: result.messageId ?? null,
+          conversationId: result.conversationId ?? null,
+        },
+        "openclaw_send_request_success",
+      );
+
+      return result;
+    } catch (error) {
+      logger.warn(
+        {
+          channel: input.channel,
+          idempotencyKey,
+          durationMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "openclaw_send_request_failure",
+      );
+      throw error;
+    }
   }
 
   async logoutChannelAccount(
     channelType: string,
     accountId?: string,
   ): Promise<LogoutChannelAccountResult> {
-    const channel =
-      channelType === "wechat" ? "openclaw-weixin" : channelType.trim();
+    const channel = resolveOpenClawChannelType(channelType.trim());
     return this.wsClient.request<LogoutChannelAccountResult>(
       "channels.logout",
       {
@@ -251,13 +321,16 @@ export class OpenClawGatewayService {
       return {
         gatewayConnected: true,
         channels: channels.map((channel) => {
-          const openclawChannelId =
-            channel.channelType === "wechat"
-              ? "openclaw-weixin"
-              : channel.channelType;
+          const openclawChannelId = resolveOpenClawChannelType(
+            channel.channelType,
+          );
+          const openclawAccountId = resolveOpenClawAccountId(
+            channel.channelType,
+            channel.accountId,
+          );
           const accounts = status.channelAccounts?.[openclawChannelId] ?? [];
           const snapshot = accounts.find(
-            (entry) => entry.accountId === channel.accountId,
+            (entry) => entry.accountId === openclawAccountId,
           );
 
           if (!snapshot) {
@@ -312,7 +385,13 @@ export class OpenClawGatewayService {
           // (they use long-polling/WS to Feishu servers, not a direct
           // inbound connection), running + configured + no error means
           // the channel is operational.
-          const operationalWithoutProbe = running && configured && !lastError;
+          const operationalWithoutProbe =
+            (running && configured && !lastError) ||
+            (isConfiguredAsConnectedChannelType(channel.channelType) &&
+              configured &&
+              !lastError);
+          const effectiveRunning =
+            enabled && (running || operationalWithoutProbe);
           const ready =
             enabled &&
             (connected ||
@@ -334,6 +413,29 @@ export class OpenClawGatewayService {
             derivedStatus = "disconnected";
           }
 
+          if (
+            openclawChannelId === "openclaw-weixin" &&
+            derivedStatus !== "connected"
+          ) {
+            logger.info(
+              {
+                channelId: channel.id,
+                accountId: channel.accountId,
+                rawSnapshot: {
+                  running,
+                  configured,
+                  connected,
+                  enabled,
+                  restartPending: snapshot.restartPending === true,
+                  lastError,
+                  probeOk: hasProbeOk,
+                },
+                derivedStatus,
+              },
+              "openclaw_weixin_live_status_non_connected",
+            );
+          }
+
           return {
             channelType: channel.channelType,
             channelId: channel.id,
@@ -341,7 +443,7 @@ export class OpenClawGatewayService {
             status: derivedStatus,
             ready,
             connected: enabled && connected,
-            running: enabled && running,
+            running: effectiveRunning,
             configured,
             lastError: friendlyError,
           };
@@ -395,10 +497,13 @@ export class OpenClawGatewayService {
 
     try {
       const status = await this.getChannelsStatus();
-      const openclawId =
-        channelType === "wechat" ? "openclaw-weixin" : channelType;
+      const openclawId = resolveOpenClawChannelType(channelType);
+      const openclawAccountId = resolveOpenClawAccountId(
+        channelType,
+        accountId,
+      );
       const accounts = status.channelAccounts?.[openclawId] ?? [];
-      const snapshot = accounts.find((a) => a.accountId === accountId);
+      const snapshot = accounts.find((a) => a.accountId === openclawAccountId);
 
       if (!snapshot) {
         if (isImplicitlyReadyChannelType(channelType)) {
@@ -442,12 +547,16 @@ export class OpenClawGatewayService {
         snapshot.running === true &&
         snapshot.configured === true &&
         snapshot.probe?.ok === true;
-      const ready = isConnected || isWebhookReady;
+      const isConfiguredReady =
+        isConfiguredAsConnectedChannelType(channelType) &&
+        snapshot.configured === true &&
+        !snapshot.lastError;
+      const ready = isConnected || isWebhookReady || isConfiguredReady;
 
       return {
         ready,
         connected: snapshot.connected ?? false,
-        running: snapshot.running ?? false,
+        running: snapshot.running ?? isConfiguredReady,
         configured: snapshot.configured ?? false,
         lastError: snapshot.lastError ?? null,
         gatewayConnected: true,
@@ -526,6 +635,8 @@ export class OpenClawGatewayService {
   }
 
   private configHash(config: OpenClawConfig): string {
-    return createHash("sha256").update(JSON.stringify(config)).digest("hex");
+    return createHash("sha256")
+      .update(serializeOpenClawConfig(config))
+      .digest("hex");
   }
 }

@@ -180,7 +180,35 @@ export class CatalogManager {
 
       rmSync(extractDir, { recursive: true, force: true });
       mkdirSync(extractDir, { recursive: true });
-      await execFileAsync("tar", ["-xzf", archivePath, "-C", extractDir]);
+      // tar on Windows quirks (only GNU tar — Git Bash's tar.exe — which
+      // commonly precedes the system bsdtar in PATH):
+      //  1. Parses a leading `C:` as a remote rsh `host:path` spec and
+      //     dies with "Cannot connect to C: resolve failed". `--force-local`
+      //     disables that. bsdtar (macOS / Windows System32) does not
+      //     accept `--force-local`, so the flag is Windows-only.
+      //  2. GNU tar also chokes on backslashes inside paths (treats `\n`
+      //     etc. as escape sequences). Forward-slash paths work for both
+      //     GNU tar and bsdtar everywhere, so normalizing is harmless and
+      //     applied unconditionally.
+      const toPosixPath = (p: string): string => p.replace(/\\/g, "/");
+      const baseTarArgs = [
+        "-xzf",
+        toPosixPath(archivePath),
+        "-C",
+        toPosixPath(extractDir),
+      ];
+      if (process.platform === "win32") {
+        // Try with --force-local first (GNU tar needs it for `C:` paths).
+        // Fall back without it for bsdtar (System32\tar.exe) which rejects
+        // the flag.
+        try {
+          await execFileAsync("tar", ["--force-local", ...baseTarArgs]);
+        } catch {
+          await execFileAsync("tar", baseTarArgs);
+        }
+      } else {
+        await execFileAsync("tar", baseTarArgs);
+      }
 
       const skills = this.buildMinimalCatalog(extractDir);
       writeFileSync(this.tempCatalogPath, JSON.stringify(skills), "utf8");
@@ -213,11 +241,12 @@ export class CatalogManager {
       .map((r) => {
         const skillMdDir = this.resolveSkillMdDir(r);
         const skillMdPath = resolve(skillMdDir, "SKILL.md");
-        const { name, description } = this.parseFrontmatter(skillMdPath);
+        const { name, catalogName, description } =
+          this.parseFrontmatter(skillMdPath);
         return {
           slug: r.slug,
           source: r.source,
-          name: name || r.slug,
+          name: catalogName || name || r.slug,
           description: description || "",
           installedAt: r.installedAt,
           agentId: r.agentId ?? null,
@@ -707,14 +736,18 @@ export class CatalogManager {
 
   private parseFrontmatter(filePath: string): {
     name: string;
+    catalogName: string;
     description: string;
   } {
     try {
-      const content = readFileSync(filePath, "utf8");
+      const content = readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
       const match = content.match(/^---\n([\s\S]*?)\n---/);
-      if (!match?.[1]) return { name: "", description: "" };
+      if (!match?.[1]) return { name: "", catalogName: "", description: "" };
       const frontmatter = match[1];
       const nameMatch = frontmatter.match(/^name:\s*['"]?(.+?)['"]?\s*$/m);
+      const catalogNameMatch = frontmatter.match(
+        /^catalog-name:\s*['"]?(.+?)['"]?\s*$/m,
+      );
 
       // Match description: single line, or multiline block after | or >
       let description = "";
@@ -740,10 +773,11 @@ export class CatalogManager {
 
       return {
         name: nameMatch?.[1]?.trim() ?? "",
+        catalogName: catalogNameMatch?.[1]?.trim() ?? "",
         description,
       };
     } catch {
-      return { name: "", description: "" };
+      return { name: "", catalogName: "", description: "" };
     }
   }
 

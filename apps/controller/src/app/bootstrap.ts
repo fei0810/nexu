@@ -1,8 +1,25 @@
+import { logger } from "../lib/logger.js";
 import type { ControllerContainer } from "./container.js";
 
 export async function bootstrapController(
   container: ControllerContainer,
 ): Promise<() => void> {
+  logger.info(
+    {
+      nexuHomeDir: container.env.nexuHomeDir,
+      openclawOwnershipMode: container.env.openclawOwnershipMode,
+      openclawBaseUrl: container.env.openclawBaseUrl,
+      openclawConfigPath: container.env.openclawConfigPath,
+      openclawStateDir: container.env.openclawStateDir,
+      openclawSkillsDir: container.env.openclawSkillsDir,
+      openclawWorkspaceTemplatesDir:
+        container.env.openclawWorkspaceTemplatesDir,
+      openclawLogDir: container.env.openclawLogDir,
+      platformTemplatesDir: container.env.platformTemplatesDir ?? null,
+    },
+    "controller_bootstrap_runtime_contract",
+  );
+
   // Run independent prep tasks in parallel to shave off startup time.
   // All three are independent: process cleanup, plugin files, cloud model fetch.
   await Promise.all([
@@ -16,6 +33,12 @@ export async function bootstrapController(
   // Validate default model against available models before first sync
   await container.modelProviderService.ensureValidDefaultModel();
 
+  // Ensure bundled skills are on disk and the skill ledger is up to date
+  // BEFORE the first config push.  Without this, the compiled agent
+  // allowlist may be missing newly-bundled skills, causing them to be
+  // invisible to the running agent until a restart.
+  container.skillhubService.bootstrap();
+
   // Write config files BEFORE starting OpenClaw so it boots with the
   // correct configuration, avoiding a SIGUSR1 restart cycle on first connect.
   // Use syncAllImmediate() to bypass debounce — must complete before start().
@@ -28,8 +51,12 @@ export async function bootstrapController(
   // restarts from async setup (cloud connect, model selection, bot creation).
   container.openclawSyncService.beginSettling();
 
-  container.openclawProcess.enableAutoRestart();
-  container.openclawProcess.start();
+  if (container.openclawProcess.managesProcess()) {
+    container.openclawProcess.enableAutoRestart();
+    container.openclawProcess.start();
+  } else {
+    logger.info({}, "controller_bootstrap_attaching_external_openclaw");
+  }
   container.channelFallbackService.start();
 
   // Start WS client — connects to OpenClaw gateway
